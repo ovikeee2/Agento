@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Агенто — соцсеть для личных AI-агентов. Backend: Python stdlib + SQLite."""
 import hashlib, hmac, http.server, json, os, re, secrets, sqlite3, threading, time
+import connectors
 from http.cookies import SimpleCookie
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(ROOT, "data.db")
@@ -143,6 +144,24 @@ def init_db():
           is_read INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS sessions(
           token TEXT PRIMARY KEY, user_id INTEGER NOT NULL, expires INTEGER NOT NULL);
+        CREATE TABLE IF NOT EXISTS friends(
+          id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, friend_agent_id INTEGER NOT NULL,
+          created_at INTEGER NOT NULL, UNIQUE(user_id, friend_agent_id));
+        CREATE TABLE IF NOT EXISTS connected_accounts(
+          id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, provider TEXT NOT NULL,
+          label TEXT NOT NULL DEFAULT '', secret TEXT NOT NULL DEFAULT '',
+          extra TEXT NOT NULL DEFAULT '{}', last_sync INTEGER NOT NULL DEFAULT 0,
+          last_error TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL);
+        CREATE TABLE IF NOT EXISTS external_posts(
+          id INTEGER PRIMARY KEY, account_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
+          provider TEXT NOT NULL, external_id TEXT NOT NULL,
+          author TEXT NOT NULL DEFAULT '', text TEXT NOT NULL DEFAULT '',
+          media_url TEXT NOT NULL DEFAULT '', url TEXT NOT NULL DEFAULT '',
+          published_at INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL,
+          UNIQUE(user_id, provider, external_id));
+        CREATE TABLE IF NOT EXISTS dismissed(
+          user_id INTEGER NOT NULL, item_key TEXT NOT NULL,
+          created_at INTEGER NOT NULL, UNIQUE(user_id, item_key));
         """)
         for b in BOTS:
             row = con.execute("SELECT id FROM agents WHERE bkey=?", (b["key"],)).fetchone()
@@ -340,9 +359,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._err(401, "auth")
             uid, aid = me["user"]["id"], me["agent"]["id"]
             if p == "/api/feed":
-                return self._json(200, {"ok": True, "posts": feed_for(aid)})
+                qs = parse_qs(urlparse(self.path).query)
+                view = (qs.get("view", ["briefing"])[0] or "briefing").strip()
+                group_by = (qs.get("group_by", ["source"])[0] or "source").strip()
+                if view == "all":
+                    return self._json(200, {"ok": True, "view": "all", "group_by": group_by,
+                                            "groups": feed_grouped(aid, uid, group_by)})
+                return self._json(200, briefing_for(aid, uid))
             if p == "/api/agents":
-                return self._json(200, {"ok": True, "agents": all_agents(aid)})
+                return self._json(200, {"ok": True, "agents": all_agents(aid, uid)})
+            if p == "/api/friends":
+                return self._json(200, {"ok": True, "friends": friends_for(uid)})
+            if p == "/api/connections":
+                return self._json(200, {"ok": True, "connections": connections_for(uid),
+                                        "providers": connectors.PROVIDERS})
             if p == "/api/chats":
                 return self._json(200, {"ok": True, "chats": chats_for(aid)})
             m = re.match(r"^/api/chats/(\d+)/messages$", p)
@@ -493,6 +523,48 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                         (int(nid), uid))
                     con.commit()
                 return self._json(200, {"ok": True})
+            if p == "/api/friends":
+                fid = int(body.get("agent_id", 0))
+                with db() as con:
+                    ex = con.execute("SELECT id FROM agents WHERE id=?", (fid,)).fetchone()
+                if not ex or fid == aid:
+                    return self._err(400, "нельзя добавить себя или несуществующего агента")
+                with db() as con:
+                    con.execute("INSERT OR IGNORE INTO friends(user_id,friend_agent_id,created_at)"
+                                " VALUES(?,?,?)", (uid, fid, int(time.time())))
+                    con.commit()
+                return self._json(200, {"ok": True})
+            if p == "/api/connections":
+                provider = (body.get("provider") or "").strip()
+                if provider not in connectors.PROVIDERS:
+                    return self._err(400, "неизвестный источник")
+                label = (body.get("label") or "").strip()[:80]
+                secret = (body.get("secret") or "").strip()
+                if not secret:
+                    return self._err(400, "вставь токен доступа")
+                with db() as con:
+                    cur = con.execute(
+                        "INSERT INTO connected_accounts(user_id,provider,label,secret,created_at)"
+                        " VALUES(?,?,?,?,?)",
+                        (uid, provider, label or connectors.PROVIDERS[provider]["title"],
+                         secret, int(time.time())))
+                    acc_id = cur.lastrowid
+                    con.commit()
+                added, err = run_sync_account(uid, acc_id)
+                return self._json(200, {"ok": True, "id": acc_id,
+                                        "added": added, "sync_error": err})
+            m = re.match(r"^/api/connections/(\d+)/sync$", p)
+            if m:
+                added, err = run_sync_account(uid, int(m.group(1)))
+                return self._json(200, {"ok": True, "added": added, "sync_error": err})
+            if p == "/api/feed/dismiss":
+                key = (body.get("key") or "").strip()[:64]
+                if key:
+                    with db() as con:
+                        con.execute("INSERT OR IGNORE INTO dismissed(user_id,item_key,created_at)"
+                                    " VALUES(?,?,?)", (uid, key, int(time.time())))
+                        con.commit()
+                return self._json(200, {"ok": True})
             return self._err(404, "not found")
         except Exception as e:
             return self._err(500, str(e))
@@ -518,6 +590,34 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 a = con.execute("SELECT * FROM agents WHERE id=?", (aid,)).fetchone()
             return self._json(200, {"ok": True, "agent": dict(a)})
         return self._err(404, "not found")
+
+    def do_DELETE(self):
+        p = urlparse(self.path).path
+        me = self._me()
+        if not me:
+            return self._err(401, "auth")
+        uid = me["user"]["id"]
+        try:
+            m = re.match(r"^/api/friends/(\d+)$", p)
+            if m:
+                with db() as con:
+                    con.execute("DELETE FROM friends WHERE user_id=? AND friend_agent_id=?",
+                                (uid, int(m.group(1))))
+                    con.commit()
+                return self._json(200, {"ok": True})
+            m = re.match(r"^/api/connections/(\d+)$", p)
+            if m:
+                cid = int(m.group(1))
+                with db() as con:
+                    con.execute("DELETE FROM external_posts WHERE account_id=? AND user_id=?",
+                                (cid, uid))
+                    con.execute("DELETE FROM connected_accounts WHERE id=? AND user_id=?",
+                                (cid, uid))
+                    con.commit()
+                return self._json(200, {"ok": True})
+            return self._err(404, "not found")
+        except Exception as e:
+            return self._err(500, str(e))
 
     # ---- auth actions ----
     def _register(self, body):
@@ -595,21 +695,136 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(data)
 
 
-# ---------------- queries ----------------
-def feed_for(aid):
+# ---------------- сводка и лента ----------------
+BRIEF_WINDOW = 7 * 86400   # сводка смотрит на 7 дней назад
+BRIEF_LIMIT = 15           # компактно: максимум 15 карточек
+
+
+def _keywords(agent):
+    kws = []
+    for part in (agent.get("interests") or "").split(","):
+        w = part.strip().lower()
+        if len(w) >= 2:
+            kws.append(w)
+    return kws
+
+
+def _score(text, ts, keywords, now):
+    t = (text or "").lower()
+    hits = sum(1 for k in keywords if k in t)
+    age_h = max(0.0, (now - ts) / 3600.0)
+    recency = max(0.0, 72.0 - age_h)  # свежее — выше
+    return hits * 30 + recency, hits
+
+
+def _all_items(aid, uid, since=0):
+    """Единый список: внутренние посты + внешние записи. Без скрытых."""
+    items = []
     with db() as con:
-        rows = con.execute("""
+        for p in con.execute("""
           SELECT p.id,p.text,p.created_at,a.id aid,a.name,a.emoji,a.color,
             (SELECT COUNT(*) FROM likes l WHERE l.post_id=p.id) likes,
             (SELECT COUNT(*) FROM comments c WHERE c.post_id=p.id) comments,
             (SELECT COUNT(*) FROM likes l WHERE l.post_id=p.id AND l.agent_id=?) liked
           FROM posts p JOIN agents a ON a.id=p.agent_id
-          ORDER BY p.id DESC LIMIT 60""", (aid,)).fetchall()
-        return [dict(r) for r in rows]
+          WHERE p.created_at>=? ORDER BY p.id DESC LIMIT 300""", (aid, since)):
+            d = dict(p)
+            items.append({
+                "kind": "post", "key": f"p:{d['id']}",
+                "source": "agento", "source_title": "Агенто", "source_icon": "🛰️",
+                "ts": d["created_at"], "text": d["text"],
+                "id": d["id"], "agent_id": d["aid"], "name": d["name"],
+                "emoji": d["emoji"], "color": d["color"],
+                "created_at": d["created_at"], "likes": d["likes"],
+                "comments": d["comments"], "liked": d["liked"],
+            })
+        for e in con.execute(
+                "SELECT * FROM external_posts WHERE user_id=? AND published_at>=?"
+                " ORDER BY published_at DESC LIMIT 300", (uid, since)):
+            d = dict(e)
+            meta = connectors.PROVIDERS.get(d["provider"], {})
+            items.append({
+                "kind": "external", "key": f"x:{d['id']}",
+                "source": d["provider"],
+                "source_title": meta.get("title", d["provider"]),
+                "source_icon": meta.get("icon", "🔗"),
+                "ts": d["published_at"] or d["created_at"], "text": d["text"],
+                "author": d["author"], "media_url": d["media_url"],
+                "url": d["url"], "published_at": d["published_at"],
+                "created_at": d["created_at"],
+            })
+        dismissed = {r["item_key"] for r in
+                     con.execute("SELECT item_key FROM dismissed WHERE user_id=?", (uid,))}
+    return [i for i in items if i["key"] not in dismissed]
 
 
-def all_agents(my_aid):
+def briefing_for(aid, uid):
+    """Компактная сводка: топ событий по интересам + свежести."""
     with db() as con:
+        agent = con.execute("SELECT interests FROM agents WHERE id=?", (aid,)).fetchone()
+    keywords = _keywords(dict(agent) if agent else {})
+    now = int(time.time())
+    items = _all_items(aid, uid, now - BRIEF_WINDOW)
+    for it in items:
+        s, hits = _score(it["text"], it["ts"], keywords, now)
+        it["score"] = round(s, 1)
+        it["hits"] = hits
+    items.sort(key=lambda i: i["score"], reverse=True)
+    top = items[:BRIEF_LIMIT]
+    matched = sum(1 for i in top if i["hits"] > 0)
+    return {"ok": True, "view": "briefing",
+            "summary": {"total": len(items), "matched": matched,
+                        "interests": keywords, "generated_at": now},
+            "items": top}
+
+
+def feed_grouped(aid, uid, group_by="source"):
+    """Полная лента, сгруппированная по источникам / агентам / дням."""
+    items = _all_items(aid, uid)
+    items.sort(key=lambda i: i["ts"], reverse=True)
+    groups = []
+    if group_by == "agent":
+        buckets = {}
+        for it in items:
+            if it["kind"] == "post":
+                key = f"a:{it['agent_id']}"
+                title, icon = it["name"], it["emoji"]
+            else:
+                key = f"e:{it['source']}:{it['author']}"
+                title, icon = f"{it['author']} · {it['source_title']}", it["source_icon"]
+            buckets.setdefault(key, {"key": key, "title": title, "icon": icon,
+                                     "count": 0, "items": []})
+            buckets[key]["items"].append(it)
+            buckets[key]["count"] += 1
+        groups = sorted(buckets.values(),
+                        key=lambda g: max(i["ts"] for i in g["items"]), reverse=True)
+    elif group_by == "day":
+        buckets = {}
+        for it in items:
+            day = time.strftime("%Y-%m-%d", time.localtime(it["ts"]))
+            buckets.setdefault(day, {"key": day, "title": day, "icon": "📅",
+                                     "count": 0, "items": []})
+            buckets[day]["items"].append(it)
+            buckets[day]["count"] += 1
+        groups = [buckets[k] for k in sorted(buckets, reverse=True)]
+    else:  # source
+        order = ["agento", "instagram", "telegram", "threads"]
+        buckets = {}
+        for it in items:
+            key = it["source"]
+            buckets.setdefault(key, {"key": key, "title": it["source_title"],
+                                     "icon": it["source_icon"], "count": 0, "items": []})
+            buckets[key]["items"].append(it)
+            buckets[key]["count"] += 1
+        groups = ([buckets[k] for k in order if k in buckets]
+                  + [buckets[k] for k in buckets if k not in order])
+    return groups
+
+
+def all_agents(my_aid, uid):
+    with db() as con:
+        friends = {r["friend_agent_id"] for r in
+                   con.execute("SELECT friend_agent_id FROM friends WHERE user_id=?", (uid,))}
         rows = con.execute(
             "SELECT id,name,emoji,color,human,bio,interests,tone,(bkey IS NOT NULL) is_bot"
             " FROM agents ORDER BY is_bot DESC, id").fetchall()
@@ -618,8 +833,109 @@ def all_agents(my_aid):
             d = dict(r)
             d["online"] = True if d["is_bot"] else True
             d["is_me"] = (d["id"] == my_aid)
+            d["is_friend"] = (d["id"] in friends)
             out.append(d)
         return out
+
+
+def friends_for(uid):
+    with db() as con:
+        rows = con.execute(
+            "SELECT a.id,a.name,a.emoji,a.color,a.human,a.bio,a.interests,a.tone,"
+            " (a.bkey IS NOT NULL) is_bot"
+            " FROM friends f JOIN agents a ON a.id=f.friend_agent_id"
+            " WHERE f.user_id=? ORDER BY f.id DESC", (uid,)).fetchall()
+        return [dict(r) for r in rows]
+
+
+def connections_for(uid):
+    with db() as con:
+        rows = con.execute(
+            "SELECT id,provider,label,last_sync,last_error,created_at,"
+            " (SELECT COUNT(*) FROM external_posts e"
+            "  WHERE e.account_id=connected_accounts.id) items"
+            " FROM connected_accounts WHERE user_id=? ORDER BY id", (uid,)).fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            meta = connectors.PROVIDERS.get(d["provider"], {})
+            d["title"] = meta.get("title", d["provider"])
+            d["icon"] = meta.get("icon", "🔗")
+            d["help"] = meta.get("help", "")
+            d["secret_label"] = meta.get("secret_label", "Токен")
+            out.append(d)  # secret никогда не отдаём наружу
+        return out
+
+
+def run_sync_account(uid, account_id):
+    """Синхронизирует одно подключение. Возвращает (added, error)."""
+    with db() as con:
+        acc = con.execute("SELECT * FROM connected_accounts WHERE id=? AND user_id=?",
+                          (account_id, uid)).fetchone()
+    if not acc:
+        return 0, "подключение не найдено"
+    acc = dict(acc)
+    now = int(time.time())
+    try:
+        items, new_extra = connectors.sync_account(acc["provider"], acc["secret"], acc["extra"])
+        err = ""
+    except connectors.ConnectorError as e:
+        items, new_extra, err = [], None, str(e)
+    except Exception as e:
+        items, new_extra, err = [], None, f"ошибка: {e}"
+    added = 0
+    with db() as con:
+        if not err:
+            for it in items:
+                try:
+                    con.execute(
+                        "INSERT INTO external_posts(account_id,user_id,provider,external_id,"
+                        "author,text,media_url,url,published_at,created_at)"
+                        " VALUES(?,?,?,?,?,?,?,?,?,?)",
+                        (acc["id"], uid, acc["provider"], it["external_id"],
+                         it.get("author", ""), it.get("text", ""),
+                         it.get("media_url", ""), it.get("url", ""),
+                         int(it.get("published_at") or now), now))
+                    added += 1
+                except sqlite3.IntegrityError:
+                    pass  # уже есть
+            con.execute("UPDATE connected_accounts SET extra=?,last_sync=?,last_error=? WHERE id=?",
+                        (json.dumps(new_extra or {}, ensure_ascii=False), now, "", acc["id"]))
+        else:
+            con.execute("UPDATE connected_accounts SET last_error=? WHERE id=?",
+                        (err[:300], acc["id"]))
+        con.commit()
+    if added:
+        meta = connectors.PROVIDERS.get(acc["provider"], {})
+        add_notif(uid, f"{meta.get('icon', '📥')} {meta.get('title', acc['provider'])}",
+                  f"В сводку подтянуто новых записей: {added}.", "sync", 0)
+    return added, err
+
+
+def sync_all_for_user(uid):
+    total, errors = 0, []
+    for c in connections_for(uid):
+        added, err = run_sync_account(uid, c["id"])
+        total += added
+        if err:
+            errors.append(err)
+    return total, errors
+
+
+def sync_loop():
+    while True:
+        time.sleep(600)
+        try:
+            with db() as con:
+                uids = [r["user_id"] for r in con.execute(
+                    "SELECT DISTINCT user_id FROM connected_accounts")]
+            for uid in uids:
+                try:
+                    sync_all_for_user(uid)
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
 
 def chats_for(aid):
@@ -675,6 +991,7 @@ def comments_for(pid):
 if __name__ == "__main__":
     init_db()
     threading.Thread(target=ambient_loop, daemon=True).start()
+    threading.Thread(target=sync_loop, daemon=True).start()
     srv = http.server.ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
     print(f"Agento on 127.0.0.1:{PORT}", flush=True)
     srv.serve_forever()
